@@ -1,0 +1,150 @@
+import unittest,tempfile,threading,urllib.request,urllib.error,http.cookiejar,json,hashlib,time,base64
+from pathlib import Path
+import server
+class Live(unittest.TestCase):
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory();server.DB=Path(self.tmp.name)/'live.sqlite3';server.init_db()
+  self.http=server.ThreadingHTTPServer(('127.0.0.1',0),server.Handler);threading.Thread(target=self.http.serve_forever,daemon=True).start()
+  self.base='http://127.0.0.1:'+str(self.http.server_port);self.browser=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+ def tearDown(self):self.http.shutdown();self.http.server_close();self.tmp.cleanup()
+ def call(self,path,session=None,data=None):
+  headers={'Content-Type':'application/json'}
+  if session:headers.update(Authorization='Bearer '+session['token'],**{'X-CSRF-Token':session['csrf']})
+  req=urllib.request.Request(self.base+'/api'+path,headers=headers,data=json.dumps(data).encode() if data is not None else None)
+  with self.browser.open(req) as r:return json.load(r)
+ def login(self,name):return self.call('/login',data={'login':name,'password':server.DEMO_PASSWORDS[name],'tab_scoped':True})
+ def deny(self,fn,status):
+  with self.assertRaises(urllib.error.HTTPError) as e:fn()
+  self.assertEqual(e.exception.code,status)
+ def arrive(self,uid):
+  with server.connect() as c:c.execute('UPDATE presence SET arrive_at=? WHERE user_id=?',(time.time()-1,uid))
+ def test_shared_browser_tabs_are_independent(self):
+  a=self.login('employee');m=self.login('manager')
+  # Simulate an old browser cookie pointing to HR. Tab credentials still win.
+  self.call('/login',data={'login':'hr','password':server.DEMO_PASSWORDS['hr']})
+  self.assertEqual(self.call('/me',a)['user']['id'],1);self.assertEqual(self.call('/me',m)['user']['id'],2)
+  self.call('/presence',a,{'mode':'work','enter':True});self.call('/presence',m,{'mode':'work','enter':True});self.arrive(2)
+  self.call('/presence',m,{'mode':'break','location':'kitchen'})
+  self.assertEqual(self.call('/presence',a)['mode'],'work');self.assertEqual(self.call('/presence',m)['mode'],'break')
+  self.deny(lambda:self.call('/heartbeat',{'token':a['token'],'csrf':m['csrf']},{}),403)
+  self.deny(lambda:self.call('/me',{'token':'invalid','csrf':''}),401)
+  self.call('/logout',m,{})
+  self.assertEqual(self.call('/me',a)['user']['id'],1)
+  self.deny(lambda:self.call('/me',m),401)
+ def test_join_disconnect_expiry_and_shared_user_sessions(self):
+  a=self.login('employee');m=self.login('manager');h=self.login('hr')
+  def visible():return {p['id']:p for p in self.call('/office-live',a)}
+  self.assertFalse(visible()[2]['online'])
+  self.call('/presence',m,{'mode':'work','enter':True});self.assertTrue(visible()[2]['online'])
+  self.assertEqual(visible()[2]['presence']['from_location'],'entrance')
+  self.assertFalse(visible()[3]['online'])
+  self.assertNotIn('work_seconds',visible()[2]['presence'])
+  self.call('/disconnect',m,{});self.assertFalse(visible()[2]['online'])
+  self.call('/heartbeat',m,{});self.assertTrue(visible()[2]['online'])
+  with server.connect() as c:c.execute('UPDATE session_activity SET seen_at=?',(time.time()-95,))
+  self.assertFalse(visible()[2]['online'])
+  self.call('/heartbeat',m,{});m2=self.login('manager');self.call('/presence',m2,{'mode':'work','enter':True})
+  self.call('/logout',m,{})
+  self.assertTrue(visible()[2]['online']);self.call('/logout',m2,{});self.assertFalse(visible()[2]['online'])
+ def test_private_download_uses_tab_auth(self):
+  a=self.login('employee');m=self.login('colleague')
+  rid=self.call('/documents',a,{'title':'Demo','category':'Другое','filename':'demo.pdf','content':base64.b64encode(b'%PDF-1.4\nDemo\n%%EOF').decode()})['id']
+  url=self.base+f'/api/documents/{rid}/download'
+  with self.browser.open(urllib.request.Request(url,headers={'Authorization':'Bearer '+a['token']})) as r:self.assertTrue(r.read().startswith(b'%PDF'))
+  with self.assertRaises(urllib.error.HTTPError) as e:self.browser.open(urllib.request.Request(url,headers={'Authorization':'Bearer '+m['token']}))
+  self.assertEqual(e.exception.code,403)
+ def test_idle_break_and_automatic_return_are_isolated_and_accounted(self):
+  a=self.login('employee');m=self.login('manager')
+  self.call('/presence',a,{'mode':'work','enter':True});self.call('/presence',m,{'mode':'work','enter':True})
+  stamp=time.time()
+  with server.connect() as c:
+   c.execute('UPDATE presence SET changed_at=?,arrive_at=?,work_seconds=12 WHERE user_id=1',(stamp-200,stamp-195))
+   c.execute('UPDATE office_activity SET last_input=?,mode_since=? WHERE user_id=1',(stamp-130,stamp-200))
+  self.call('/heartbeat',a,{})
+  p=self.call('/people/1/presence',m)
+  self.assertEqual((p['mode'],p['location'],p['from_location']),('break','lounge','desk'))
+  self.assertTrue(p['auto_break']);self.assertAlmostEqual(p['work_seconds'],202,places=2)
+  self.assertGreaterEqual(p['current_seconds'],10)
+  self.assertEqual(self.call('/presence',m)['mode'],'work')
+  self.call('/presence',a)
+  with server.connect() as c:self.assertEqual(c.execute('SELECT break_count FROM work_shifts WHERE user_id=1 AND ended_at IS NULL').fetchone()[0],1)
+  p=self.call('/activity',a,{'idle_ms':0,'user_id':2})
+  self.assertEqual((p['mode'],p['location'],p['from_location']),('work','desk','lounge'))
+  self.assertGreaterEqual(p['break_seconds'],10)
+  status=self.call('/people/1/presence',m)
+  self.assertLess(status['current_seconds'],2)
+  self.assertFalse(status['auto_break'])
+  self.arrive(1);p=self.call('/presence',a,{'mode':'off'})
+  self.assertGreaterEqual(p['completed_shift']['break_seconds'],10)
+ def test_input_keeps_working_manual_break_and_end_are_respected(self):
+  a=self.login('employee');self.call('/presence',a,{'mode':'work','enter':True});self.arrive(1)
+  with server.connect() as c:c.execute('UPDATE office_activity SET last_input=? WHERE user_id=1',(time.time()-119,))
+  self.assertEqual(self.call('/activity',a,{'idle_ms':0})['mode'],'work')
+  self.call('/presence',a,{'mode':'break','location':'kitchen'});self.arrive(1)
+  self.assertEqual(self.call('/activity',a,{'idle_ms':0})['mode'],'break')
+  with server.connect() as c:c.execute('UPDATE office_activity SET mode_since=? WHERE user_id=1',(time.time()-40,))
+  self.call('/presence',a,{'mode':'break','location':'buffet'})
+  self.assertGreaterEqual(self.call('/people/1/presence',a)['current_seconds'],40)
+  self.arrive(1);self.call('/presence',a,{'mode':'off'})
+  self.assertEqual(self.call('/activity',a,{'idle_ms':0})['mode'],'off')
+  with server.connect() as c:self.assertEqual(c.execute('SELECT count(*) FROM work_shifts WHERE user_id=1 AND ended_at IS NULL').fetchone()[0],0)
+ def test_live_duration_access_and_activity_authentication(self):
+  a=self.login('employee');m=self.login('manager');h=self.login('hr');other=self.login('colleague')
+  self.call('/presence',a,{'mode':'work','enter':True})
+  self.assertIn('current_seconds',self.call('/people/1/presence',m))
+  self.assertIn('current_seconds',self.call('/people/1/presence',h))
+  self.deny(lambda:self.call('/people/1/presence',other),403)
+  self.deny(lambda:self.call('/people/4/presence',m),403)
+  self.deny(lambda:self.call('/activity',{'token':a['token'],'csrf':m['csrf']},{'idle_ms':0}),403)
+  for age in (-1,120001,'wrong'):
+   self.deny(lambda:self.call('/activity',a,{'idle_ms':age}),400)
+  public=next(p for p in self.call('/office-live',other) if p['id']==1)['presence']
+  self.assertNotIn('current_seconds',public);self.assertNotIn('work_seconds',public)
+ def test_exact_idle_threshold_and_input_during_walk(self):
+  a=self.login('employee');self.call('/presence',a,{'mode':'work','enter':True})
+  with server.connect() as c:
+   c.execute('BEGIN IMMEDIATE')
+   c.execute('UPDATE presence SET changed_at=1000,arrive_at=1005 WHERE user_id=1')
+   c.execute('UPDATE office_activity SET last_input=1000,mode_since=1000 WHERE user_id=1')
+   server.sync_idle(c,1,1119.99)
+   self.assertEqual(c.execute('SELECT mode FROM presence WHERE user_id=1').fetchone()[0],'work')
+   server.sync_idle(c,1,1120)
+   self.assertEqual(c.execute('SELECT mode FROM presence WHERE user_id=1').fetchone()[0],'break')
+   c.execute('UPDATE office_activity SET last_input=1121 WHERE user_id=1')
+   server.sync_idle(c,1,1121)
+   self.assertEqual(c.execute('SELECT mode FROM presence WHERE user_id=1').fetchone()[0],'break')
+   server.sync_idle(c,1,1125)
+   p=c.execute('SELECT * FROM presence WHERE user_id=1').fetchone()
+   self.assertEqual(p['mode'],'work');self.assertEqual(p['break_seconds'],5)
+ def test_map_timer_requires_manager_or_hr_even_for_self(self):
+  a=self.login('employee');m=self.login('manager');h=self.login('hr');other=self.login('colleague')
+  self.call('/presence',a,{'mode':'work','enter':True});self.arrive(1)
+  with server.connect() as c:c.execute('UPDATE office_activity SET mode_since=? WHERE user_id=1',(time.time()-45,))
+  for viewer in (m,h):
+   p=self.call('/people/1/map-presence',viewer)
+   self.assertEqual(p['mode'],'work');self.assertGreaterEqual(p['current_seconds'],45)
+  for viewer in (a,other):self.deny(lambda:self.call('/people/1/map-presence',viewer),403)
+  self.deny(lambda:self.call('/people/4/map-presence',m),403)
+  self.call('/presence',a,{'mode':'break','location':'lounge'})
+  with server.connect() as c:c.execute('UPDATE office_activity SET mode_since=? WHERE user_id=1',(time.time()-20,))
+  p=self.call('/people/1/map-presence',m)
+  self.assertEqual(p['mode'],'break');self.assertGreaterEqual(p['current_seconds'],20)
+ def test_npc_timers_are_shared_by_map_and_colleague_card(self):
+  a=self.login('employee');m=self.login('manager');h=self.login('hr')
+  for uid in (5,6,7,8,9):
+   card=self.call('/people/'+str(uid)+'/presence',m)
+   bubble=self.call('/people/'+str(uid)+'/map-presence',h)
+   public=next(p for p in self.call('/office-live',m) if p['id']==uid)
+   self.assertTrue(public['demo']);self.assertTrue(card['demo'])
+   self.assertEqual(card['mode'],bubble['mode']);self.assertEqual(card['mode'],public['presence']['mode'])
+   self.assertAlmostEqual(card['current_seconds'],bubble['current_seconds'],delta=2)
+   self.assertNotIn('current_seconds',public['presence']);self.assertNotIn('work_seconds',public['presence'])
+   self.deny(lambda:self.call('/people/'+str(uid)+'/presence',a),403)
+  self.assertEqual(self.call('/people/1/map-presence',m)['mode'],'off')
+  with server.connect() as c:
+   working=server.demo_npc_presence(c,5,1800)
+   resting=server.demo_npc_presence(c,5,1920)
+   self.assertEqual((working['mode'],working['current_seconds']),('work',5))
+   self.assertEqual((resting['mode'],resting['current_seconds']),('break',5))
+   self.assertIsNone(server.demo_npc_presence(c,1))
+if __name__=='__main__':unittest.main()

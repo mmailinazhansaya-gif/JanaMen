@@ -1,0 +1,10 @@
+services:
+  janamen:
+    build: .
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - janamen_data:/app/data
+    restart: unless-stopped
+volumes:
+  janamen_data:
